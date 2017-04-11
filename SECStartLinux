@@ -1,0 +1,42 @@
+#!/bin/sh
+#
+### BEGIN INIT INFO
+# Provides: SECStartLinux
+# Required-Start: $ALL
+# Should-Start:
+# Required-Stop:
+# Should-Stop:
+# Default-Start:  2 3 5
+# Default-Stop:
+# Short-Description: SECStartLinux start/stop script
+# Description: SECStartLinux start/stop script
+### END INIT INFO
+. /etc/rc.status
+# Main ###
+# This is just a wrapper program to enable nohup script
+# calling SequencialStopStartLogic without a lot of recoding
+
+rc_reset
+
+case "$1" in
+    start)
+        echo "Monitor start progress via command: tail -30f /opt/cldscripts/secstartlinux_home/work/secstartlinux.log"        
+        nohup /opt/cldscripts/secstartlinux_home/SequencialStopStartLogic start &
+        rc_status -v
+        ;; 
+    stop)
+        echo "Monitor stop progress via command: tail -30f /opt/cldscripts/secstartlinux_home/work/secstartlinux.log"
+        timeout 300 /opt/cldscripts/secstartlinux_home/SequencialStopStartLogic stop 
+        rc_status -v
+        ;;
+    restart)
+        echo "Monitor restart progress via command: tail -30f /opt/cldscripts/secstartlinux_home/work/secstartlinux.log"
+        nohup /opt/cldscripts/secstartlinux_home/SequencialStopStartLogic restart &
+        rc_status -v
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|restart}"
+        exit 1
+        ;;
+    esac
+rc_exit

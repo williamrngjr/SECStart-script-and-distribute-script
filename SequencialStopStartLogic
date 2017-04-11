@@ -1,0 +1,531 @@
+#!/bin/sh
+#
+### BEGIN INIT INFO
+# Provides: SequencialStopStartLogic
+# Required-Start: $ALL
+# Should-Start:
+# Required-Stop:
+# Should-Stop:
+# Default-Start:  2 3 5
+# Default-Stop:
+# Short-Description: SequencialStopStartLogic start/stop script
+# Description: SequencialStopStartLogic start/stop script
+### END INIT INFO
+
+###############################################################################
+# =====Version 1.4.0 =====
+#
+# This script will recurse through all profiles to check which SAP application 
+# (i.e. HANA ABAP J2EE and WD) exists in this server. It will then for each of 
+# the detected SIDs, at linux startup time (after cloning) perform several se-
+# quential function with corresponding scripts
+#    1. prestop_scripts() 
+#    2. app_stop()
+#    4. app_start()
+#    5. poststart_scripts()
+#	
+# 1. Adapt profile accordingly to the landscape where the system belongs to
+#    A. CDA has the format DIR_TRANS = /usr/sap/trans-cl1/CDA/trans_<SID>
+#    B. CTA has the format DIR_TRANS = /usr/sap/trans-cl1/trans/CTA/trans_<SID>
+#    C. Showrooms has the format DIR_TRANS = /usr/sap/trans
+# 2. If CTA/Showroom, run /opt/cldscripts/gen_lct.sh 
+# 3. during startup, try first to start the HANA database for dependencies
+#
+# Initial Version   : C5180323 	: Nov 22, 2016
+#                     copied SID detection from secmon linux script
+#
+# Version 1.3.3     : C5180323 	: Nov 30, 2016
+#                     This version uses SYSTYPE convention 1HANA 2ABAP 3J2EE 
+#                     4WEBDISPATCHER to simplify dependency checks. heirarchy 
+#                     normally most systems has dependencies on their corres-
+#                     ponding HANA databases. Still others like J2EE has 
+#                     dependencies on the ABAP as their UME, hence the num-
+#                     bering and prioritization.
+#
+# Version 1.3.4     : C5180323 	: Nov 30, 2016 
+#                     Also added 2 minutes sleep time in check_for_dbdepen-
+#                     dencies before checking HANA status to give time for 
+#                     server to initiate HANA startup - if not, the return 
+#                     code for sapcontrol stored in variable HANASTATUS is 
+#                     erratic
+#
+# Version 1.3.4     : C5180323 : Nov 30, 2016 
+#                     Removed nohup in starting HANA. Added prestop_script
+#                     to put secmon to maintenance and to poststart_script 
+#                     to put back to productive
+#
+# Version 1.3.5     : C5180323 : Dec 06, 2016 
+#                     New function inspect_dependency created - this is 
+#                     because the prior grep command was inconsistent during 
+#                     the very beginning of linux startup
+#
+# Version 1.3.6     : C5180323 : Dec 07, 2016 
+#                     Converted all tabs to spaces for more readability.
+#                     Refined comments on functions. Moved rc_status -v
+#                     after case loop to avoid "failed" message in console
+#
+# Version 1.3.7     : C5180323 : Dec 09, 2016 
+#                     Added more explicit profile adaptation - not touch lines
+#                     that doesn't start with DIR_TRANS DIR_EPS_ROOT 
+#
+# Version 1.3.8     : D040046 & C5180323 : Dec 15, 2016 
+#                     Added download of metadata prop to /opt/cldscripts
+#                     Added logic to check if DIR_TRANS doesn't exist then put
+#                     in in the instance profile 
+#
+# Version 1.3.9     : C5180323 : Dec 22, 2016 
+#                     Added J2EE dependency check in appstart function
+#
+# Version 1.4.0     : C5180323 : Dec 29, 2016 
+#                     Added a wrapper script for nohup feature. new script SECStart
+#                     Added more logging refinements to be more user friendly
+#
+#
+# Version 1.5.2     : C5180323 : Mar 20, 2017
+#                     Added new features for caling secmon.sh serverdown_mode for
+#                     the light blue status, timeout feature for stopping requested
+#                     by VI team, also added auto update and healing like in secmon
+###############################################################################
+. /etc/rc.status
+
+VERSION="1.4.0"
+
+#Log files and scripts to run
+# Determine environment and set more global vars
+SECSTARTLINUX_HOME='/opt/cldscripts/secstartlinux_home' #where to start script is located and log under work DIR
+SCRIPTS_HOME='/opt/cldscripts' #location of gen_lct.sh, lct abap program reference this location too
+WORK="$SECSTARTLINUX_HOME/work"
+FENCE="$WORK/fence.txt"
+SIDLIST="$WORK/sids.txt"
+SIDPREDEFINED="$WORK/sidsdefined.txt"
+NEEDEDDBSTAT="$WORK/dbdependency.txt"
+#Log files
+SECSTARTLINUX_LOG="$WORK/secstartlinux.log"
+PRESTOP_SCRIPTS_LOG="$WORK/prestop_scripts.log"
+APPSTOP_LOG="$WORK/appstop.log"
+APPSTART_LOG="$WORK/appstart.log"
+POSTSTART_SCRIPTS_LOG="$WORK/poststart_scripts.log"
+
+#Custom scripts if needed in the future
+PRESTOP_SCRIPTS="$SECSTARTLINUX_HOME/prestop_scripts.txt"
+POSTSTART_SCRIPTS="$SECSTARTLINUX_HOME/poststart_scripts.txt"
+FENCE="$WORK/fence.txt"
+UNWANTED_SIDS='DAA|DAB|DAC|DAD|DA1|DA2|DA3'
+
+DEBUG=""
+# log function. can write to 1 logfile or 2 logfiles
+function log() {
+    TIMESTAMP="$(date "+%F_%T") : "
+    ANOTHERLOGFILE=$3
+    if [ -n "$DEBUG" ]
+    then
+        echo -n "$TIMESTAMP" | tee -a $2
+        echo $1 | tee -a $2
+        [ ! -z "$ANOTHERLOGFILE" ] && echo -n "$TIMESTAMP" | tee -a $3
+        [ ! -z "$ANOTHERLOGFILE" ] && echo $1 | tee -a $3
+    else
+        echo -n "$TIMESTAMP" >> $2
+        echo $1 >> $2
+        [ ! -z "$ANOTHERLOGFILE" ] && echo -n "$TIMESTAMP" >> $3
+        [ ! -z "$ANOTHERLOGFILE" ] && echo $1 >> $3
+    fi
+}
+
+# checks what landscape we are in by analyzing metaData.prop
+#function WhereAreWe {
+#    log "Function WhereAreWe started to check which landscape this VM belongs to." $SECSTARTLINUX_LOG
+#    local MD_PROP="${WORK}/metaData.prop"
+#    local FENCE_TXT=$FENCE
+#    local BASH_MD_PROP="$WORK/md.sh"
+
+#    test -f $MD_PROP && rm -f  $MD_PROP
+#    unset http_proxy
+#    /usr/bin/wget --quiet -O $MD_PROP  http://f0vlm:1080/metaData.prop
+
+    # assume we are in CDA if we cannot retreive metaData.prop
+#    if [ ! -s $MD_PROP ]; then
+#        rm -f $MD_PROP
+#        clusterName='CDA'
+#        log "Script was not able to retrieve metaData.prop. Script will assume this VM is in the master landscape." $SECSTARTLINUX_LOG
+#        VLLANDSCAPE="CDA"
+#    else
+#        test -f  $FENCE_TXT && rm -f $FENCE_TXT
+#        /usr/bin/wget --quiet -O $FENCE_TXT  http://f0vlm:1080/fence.txt
+#        /usr/bin/dos2unix --quiet $MD_PROP
+#        /usr/bin/dos2unix --quiet $FENCE_TXT
+#        rm -f $BASH_MD_PROP
+#        cat $MD_PROP | sed 's/&/,/g' | sed -r 's/(.*)=(.*)/\1="\2"/g' > $BASH_MD_PROP
+#        source $BASH_MD_PROP
+#        log "WhereAreWe detected VM is in landscape ${order}" $SECSTARTLINUX_LOG
+#        VLLANDSCAPE="${order}"
+        # download the metaData.prop to /opt/cldscripts/metaData.prop # added d040046 20161214
+#       wget --quiet --no-proxy http://f0vlm:1080/metaData.prop -O /opt/cldscripts/metaData.prop
+#   fi
+#}
+
+# returns 0 if hana is up and running
+target_hana_running () {
+    unset COUNT
+    COUNT=$(grep -i "RED"  $NEEDEDDBSTAT | wc -l)
+    test -z $COUNT && COUNT=0
+    if [ "$COUNT" -gt "0" ]; then
+        return 1
+    else
+        unset COUNT
+        COUNT=$(grep -i "YELLOW"  $NEEDEDDBSTAT | wc -l)
+        test -z $COUNT && COUNT=0
+        if [ "$COUNT" -gt "0" ]; then
+            return 1
+         else
+            unset COUNT
+            COUNT=$(grep -i "GRAY"  $NEEDEDDBSTAT | wc -l)
+            test -z $COUNT && COUNT=0
+            if [ "$COUNT" -gt "0" ]; then
+                return 1
+            else
+                unset COUNT
+                COUNT=$(grep -i "Indexserver"  $NEEDEDDBSTAT | grep "GREEN" | wc -l)
+                test -z $COUNT && COUNT=0
+                if [ "$COUNT" -lt "1" ]; then
+                    return 1
+                else
+                    return 0
+                fi
+            fi
+        fi
+    fi
+}
+
+# checks and wait for target hana database in another server or also in this same local server to be up and running
+# wait maximum of 15 min for target server to be pingable
+# wait maximum of 1 hr for target database to be up and running
+check_for_dbdependencies() {
+    log "$SID : check_for_dbdependencies function started" $SECSTARTLINUX_LOG $APPSTART_LOG
+    if egrep -q 'dbms/type.*=.*hdb' /usr/sap/${SID}/SYS/profile/DEFAULT.PFL; then
+        log "System $SID detected to be using DBMS TYPE HANA." $SECSTARTLINUX_LOG $APPSTART_LOG
+        SAPDBHOST=$(grep -w ^SAPDBHOST /usr/sap/${SID}/SYS/profile/DEFAULT.PFL | awk -F '=' '{print $2}' | tr -d '[:blank:]' | head -1)
+        DBNAME=$(grep -i dbname /usr/sap/${SID}/SYS/profile/DEFAULT.PFL | awk -F '=' '{print $2}' | tr -d '[:blank:]' | head -1)
+        DBADM=$(echo $DBNAME | tr '[:upper:]' '[:lower:]')
+        DBADM=${DBADM}adm
+        SAPDBHOST=$(echo $SAPDBHOST | tr '[:upper:]' '[:lower:]')
+        THISSERVER=$(echo $HOSTNAME | tr '[:upper:]' '[:lower:]')
+
+        if [ -z "$SAPDBHOST" ]; then #no way to check the host of the target dependency for now other than SAPDBHOST
+            log "Could not get the SAPDBHOST" $APPSTART_LOG $SECSTARTLINUX_LOG
+            log "System $SID uses HDB but we cannot determine the parameter SAPDBHOST from the DEFAULT profile. Pls check manually & start as needed. $SID cannot be started because of this failed dependency." $APPSTART_LOG
+            log "check_for_dbdependencies function returns 1 for System $SID" $SECSTARTLINUX_LOG $APPSTART_LOG
+            return 1
+        fi
+        #Proceed if profile has SAPDBHOST parameter
+        #if database resides also in this same local server
+        if [ "$SAPDBHOST" == "$THISSERVER" ]; then
+            DBNUMBER=$(grep $DBNAME ${WORK}/sids.txt | awk -F: '{print $3}')
+            log "Target database for $SID was detected to be $DBNAME located in this same local server" $APPSTART_LOG $SECSTARTLINUX_LOG
+            test -f $NEEDEDDBSTAT && rm -f $NEEDEDDBSTAT
+            su - $DBADM -c "sapcontrol -nr ${DBNUMBER} -function GetProcessList" > $NEEDEDDBSTAT
+            while ! target_hana_running #while target_hana_running returns NOT OK
+                do
+                    log "Hana DB is not completely running on this server -> wait 2 minutes, then re-check ($count)" $APPSTART_LOG $SECSTARTLINUX_LOG
+                    count=$(expr $count + 1)
+                    sleep 120
+                    test -f $NEEDEDDBSTAT && rm -f $NEEDEDDBSTAT
+                    su - $DBADM -c "sapcontrol -nr ${DBNUMBER} -function GetProcessList" > $NEEDEDDBSTAT
+                    if [ $count = "30" ]; then
+                        log "The HANA database $DBNAME is not up and running in this local server after waiting for 60 minutes. Pls check and manually start as needed. $SID cannot be started because of this failed dependency." $APPSTART_LOG $SECSTARTLINUX_LOG
+                        log "check_for_dbdependencies function returns 1 for System $SID because local hana db is not up" $SECSTARTLINUX_LOG $APPSTART_LOG
+                        return 1
+                    fi
+                done
+            log "check_for_dbdependencies function returns 0 for System $SID" $SECSTARTLINUX_LOG $APPSTART_LOG
+            return 0	        			
+        else #database is on another server
+            while  ! ping -c 3 $SAPDBHOST
+                do
+                log "The host $SAPDBHOST is not pingable" $$APPSTART_LOG $SECSTARTLINUX_LOG
+                countping=$(expr $countping + 1)
+                sleep 30
+                if [ $countping = "30" ]; then
+                    log "The host $SAPDBHOST is not pingable after 15 minutes. Pls check and manually start as needed. $SID cannot be started because of this failed dependency." $APPSTART_LOG  $SECSTARTLINUX_LOG
+                    log "check_for_dbdependencies function returns 1 for System $SID" $SECSTARTLINUX_LOG $APPSTART_LOG
+                    return 1
+                fi
+            done
+            DBNUMBER=$(ssh -q -i /root/hanacheck.rsa ${DBADM}@$SAPDBHOST grep $DBNAME ${WORK}/sids.txt | awk -F: '{print $3}')
+            log "Target database for $SID was detected to be $DBNAME on another linux server $SAPDBHOST" $APPSTART_LOG $SECSTARTLINUX_LOG
+            test -f $NEEDEDDBSTAT && rm -f $NEEDEDDBSTAT
+            ssh -i /root/hanacheck.rsa ${DBADM}@$SAPDBHOST "sapcontrol -nr ${DBNUMBER} -function GetProcessList" > $NEEDEDDBSTAT
+            while ! target_hana_running #while target_hana_running returns NOT OK
+                do
+                    log "Hana DB is not completely running on host $SAPDBHOST -> wait 5 minutes, then re-check ($count)" $APPSTART_LOG $SECSTARTLINUX_LOG
+                    count=$(expr $count + 1)
+                    sleep 120
+                    test -f $NEEDEDDBSTAT && rm -f $NEEDEDDBSTAT
+                    ssh -i /root/hanacheck.rsa ${DBADM}@$SAPDBHOST "sapcontrol -nr ${DBNUMBER} -function GetProcessList" > $NEEDEDDBSTAT
+                    if [ $count = "30" ]; then
+                        log "The HANA database $DBNAME is not up and running in the target host $SAPDBHOST after waiting for 60 minutes. Pls check and manually start as needed. $SID cannot be started because of this failed dependency." $APPSTART_LOG $SECSTARTLINUX_LOG
+                        log "check_for_dbdependencies function returns 1 for System $SID" $SECSTARTLINUX_LOG $APPSTART_LOG
+                        return 1
+                    fi
+                done
+            log "check_for_dbdependencies function returns 0 for System $SID after checking remote db status" $SECSTARTLINUX_LOG $APPSTART_LOG
+            return 0	        
+         fi
+    elif egrep -q 'j2ee/dbtype.*=.*hdb' /usr/sap/${SID}/SYS/profile/DEFAULT.PFL; then
+        log "J2EE system $SID detected to be using DBMS TYPE HANA." $SECSTARTLINUX_LOG $APPSTART_LOG
+        SAPDBHOST=$(grep -w ^SAPDBHOST /usr/sap/${SID}/SYS/profile/DEFAULT.PFL | awk -F '=' '{print $2}' | tr -d '[:blank:]' | head -1)
+        DBNAME=$(grep -i dbname /usr/sap/${SID}/SYS/profile/DEFAULT.PFL | awk -F '=' '{print $2}' | tr -d '[:blank:]' | head -1)
+        DBADM=$(echo $DBNAME | tr '[:upper:]' '[:lower:]')
+        DBADM=${DBADM}adm
+        SAPDBHOST=$(echo $SAPDBHOST | tr '[:upper:]' '[:lower:]')
+        THISSERVER=$(echo $HOSTNAME | tr '[:upper:]' '[:lower:]')
+
+        if [ -z "$SAPDBHOST" ]; then #no way to check the host of the target dependency for now other than SAPDBHOST
+            log "Could not get the SAPDBHOST" $APPSTART_LOG $SECSTARTLINUX_LOG
+            log "System $SID uses HDB but we cannot determine the parameter SAPDBHOST from the DEFAULT profile. Pls check manually & start as needed. $SID cannot be started because of this failed dependency." $APPSTART_LOG
+            log "check_for_dbdependencies function returns 1 for System $SID" $SECSTARTLINUX_LOG $APPSTART_LOG
+            return 1
+        fi
+        #Proceed if profile has SAPDBHOST parameter
+        #if database resides also in this same local server
+        if [ "$SAPDBHOST" == "$THISSERVER" ]; then
+            DBNUMBER=$(grep $DBNAME ${WORK}/sids.txt | awk -F: '{print $3}')
+            log "Target database for $SID was detected to be $DBNAME located in this same local server" $APPSTART_LOG $SECSTARTLINUX_LOG
+            test -f $NEEDEDDBSTAT && rm -f $NEEDEDDBSTAT
+            su - $DBADM -c "sapcontrol -nr ${DBNUMBER} -function GetProcessList" > $NEEDEDDBSTAT
+            while ! target_hana_running #while target_hana_running returns NOT OK
+                do
+                    log "Hana DB is not completely running on this server -> wait 2 minutes, then re-check ($count)" $APPSTART_LOG $SECSTARTLINUX_LOG
+                    count=$(expr $count + 1)
+                    sleep 120
+                    test -f $NEEDEDDBSTAT && rm -f $NEEDEDDBSTAT
+                    su - $DBADM -c "sapcontrol -nr ${DBNUMBER} -function GetProcessList" > $NEEDEDDBSTAT
+                    if [ $count = "30" ]; then
+                        log "The HANA database $DBNAME is not up and running in this local server after waiting for 60 minutes. Pls check and manually start as needed. $SID cannot be started because of this failed dependency." $APPSTART_LOG $SECSTARTLINUX_LOG
+                        log "check_for_dbdependencies function returns 1 for System $SID because local hana db is not up" $SECSTARTLINUX_LOG $APPSTART_LOG
+                        return 1
+                    fi
+                done
+            log "check_for_dbdependencies function returns 0 for System $SID" $SECSTARTLINUX_LOG $APPSTART_LOG
+            return 0	        			
+        else #database is on another server
+            while  ! ping -c 3 $SAPDBHOST
+                do
+                log "The host $SAPDBHOST is not pingable" $$APPSTART_LOG $SECSTARTLINUX_LOG
+                countping=$(expr $countping + 1)
+                sleep 30
+                if [ $countping = "30" ]; then
+                    log "The host $SAPDBHOST is not pingable after 15 minutes. Pls check and manually start as needed. $SID cannot be started because of this failed dependency." $APPSTART_LOG  $SECSTARTLINUX_LOG
+                    log "check_for_dbdependencies function returns 1 for System $SID" $SECSTARTLINUX_LOG $APPSTART_LOG
+                    return 1
+                fi
+            done
+            DBNUMBER=$(ssh -q -i /root/hanacheck.rsa ${DBADM}@$SAPDBHOST grep $DBNAME ${WORK}/sids.txt | awk -F: '{print $3}')
+            log "Target database for $SID was detected to be $DBNAME on another linux server $SAPDBHOST" $APPSTART_LOG $SECSTARTLINUX_LOG
+            test -f $NEEDEDDBSTAT && rm -f $NEEDEDDBSTAT
+            ssh -i /root/hanacheck.rsa ${DBADM}@$SAPDBHOST "sapcontrol -nr ${DBNUMBER} -function GetProcessList" > $NEEDEDDBSTAT
+            while ! target_hana_running #while target_hana_running returns NOT OK
+                do
+                    log "Hana DB is not completely running on host $SAPDBHOST -> wait 5 minutes, then re-check ($count)" $APPSTART_LOG $SECSTARTLINUX_LOG
+                    count=$(expr $count + 1)
+                    sleep 120
+                    test -f $NEEDEDDBSTAT && rm -f $NEEDEDDBSTAT
+                    ssh -i /root/hanacheck.rsa ${DBADM}@$SAPDBHOST "sapcontrol -nr ${DBNUMBER} -function GetProcessList" > $NEEDEDDBSTAT
+                    if [ $count = "30" ]; then
+                        log "The HANA database $DBNAME is not up and running in the target host $SAPDBHOST after waiting for 60 minutes. Pls check and manually start as needed. $SID cannot be started because of this failed dependency." $APPSTART_LOG $SECSTARTLINUX_LOG
+                        log "check_for_dbdependencies function returns 1 for System $SID" $SECSTARTLINUX_LOG $APPSTART_LOG
+                        return 1
+                    fi
+                done
+            log "check_for_dbdependencies function returns 0 for System $SID after checking remote db status" $SECSTARTLINUX_LOG $APPSTART_LOG
+            return 0	        
+         fi
+    fi
+    log "check_for_dbdependencies did not find any dependencies. And the function returns 0 for System $SID" $SECSTARTLINUX_LOG $APPSTART_LOG
+    return 0 
+}
+
+# prestop_scripts will disable secmon and put it temporarily to maintenance
+prestop_scripts() {
+    log  "$SID : prestop_scripts function started" $SECSTARTLINUX_LOG $PRESTOP_SCRIPTS_LOG
+    nohup $SCRIPTS_HOME/secmon.sh serverdown_mode $SID >> $PRESTOP_SCRIPTS_LOG 2>&1 &
+    log  "prestop_scripts function completed." $SECSTARTLINUX_LOG $PRESTOP_SCRIPTS_LOG
+}
+
+# app_stop will stop the systems but without nohup to ensure consistent and clean shutdown
+app_stop() {
+    log "$SID : app_stop function started" $SECSTARTLINUX_LOG $APPSTOP_LOG
+    SIDADM=$(echo $SID | tr '[:upper:]' '[:lower:]')
+    SIDADM=${SIDADM}adm    
+    case "$SYSTYPE" in
+        1HANA)
+            log " app_stop will try to stop HANA system $SID" $APPSTOP_LOG $SECSTARTLINUX_LOG
+            su - $SIDADM -c "HDB stop" >> $APPSTOP_LOG 2>&1
+            echo "HANA stop command triggered. Waiting for HANA to be completely down."
+            ;;
+        2ABAP)
+            log " app_stop will try to stop ABAP system $SID" $APPSTOP_LOG $SECSTARTLINUX_LOG
+            su - $SIDADM -c "stopsap" >> $APPSTOP_LOG 2>&1
+            echo "SAP ABAP stop command triggered. Waiting for ABAP to be completely down."
+            ;;
+        3J2EE)
+            log " app_stop will try to stop J2EE system $SID" $APPSTOP_LOG $SECSTARTLINUX_LOG
+            su - $SIDADM -c "stopsap" >> $APPSTOP_LOG 2>&1
+            echo "SAP J2EE stop command triggered. Waiting for J2EE to be completely down."
+            ;;
+        4WEBDISPATCHER)
+            log " app_stop will try to stop WEBDISPATCHER system $SID" $APPSTOP_LOG $SECSTARTLINUX_LOG
+            su - $SIDADM -c "stopsap" >> $APPSTOP_LOG 2>&1
+            echo "WEBDISPATCHER stop command triggered. Waiting for WEBDISPATCHER to be completely down."
+            ;;
+        *)
+            log "app_stop function only handles WD J2EE ABAP and HANA for now." $APPSTOP_LOG $SECSTARTLINUX_LOG
+    esac
+    log "app_stop function completed." $SECSTARTLINUX_LOG $APPSTOP_LOG
+}
+
+# app_start will start the system using nohup start commands and checks for dependencies when needed
+app_start() {
+    log "$SID : app_start function started for System with System Number $SYSNO " $SECSTARTLINUX_LOG $APPSTART_LOG	
+    SIDADM=$(echo $SID | tr '[:upper:]' '[:lower:]')
+    SIDADM=${SIDADM}adm
+    case "$SYSTYPE" in
+        1HANA)
+            log "app_start function will try to start HANA system $SID with nohup session" $APPSTART_LOG $SECSTARTLINUX_LOG
+            su - $SIDADM -c "HDB start" >> $APPSTART_LOG 2>&1
+            ;;
+        2ABAP)
+            log "app_start function will try to start ABAP system $SID after checking for dependencies" $APPSTART_LOG $SECSTARTLINUX_LOG
+            if check_for_dbdependencies; then 
+                su - $SIDADM -c "startsap" >> $APPSTART_LOG 2>&1
+                log "app_start function just issued a nohup startsap command." $APPSTART_LOG $SECSTARTLINUX_LOG
+            else 
+                log "app_start function did not try to start ABAP because of failed dependencies." $APPSTART_LOG $SECSTARTLINUX_LOG
+            fi
+            ;;
+        3J2EE)
+            log "app_start function will try to start J2EE system $SID after checking for dependencies" $APPSTART_LOG $SECSTARTLINUX_LOG
+            if check_for_dbdependencies; then 
+                su - $SIDADM -c "startsap" >> $APPSTART_LOG 2>&1
+                log "app_start function just issued a nohup startsap command." $APPSTART_LOG $SECSTARTLINUX_LOG
+            else 
+                log "app_start function did not try to start ABAP because of failed dependencies." $APPSTART_LOG $SECSTARTLINUX_LOG
+            fi
+            ;;
+        4WEBDISPATCHER)
+            log "app_start function will try to start WEBDISPATCHER system $SID" $APPSTART_LOG $SECSTARTLINUX_LOG
+            su - $SIDADM -c "startsap" >> $APPSTART_LOG 2>&1
+            ;;
+        *)
+            log "app_start function only starts HANA ABAP J2EE and WD for now." $APPSTART_LOG $SECSTARTLINUX_LOG
+    esac
+    log "app_start function completed" $SECSTARTLINUX_LOG $APPSTART_LOG
+}
+
+# poststart_scripts will bring back secmon to productive
+poststart_scripts() {
+    log "$SID : poststart_scripts function started" $SECSTARTLINUX_LOG $POSTSTART_SCRIPTS_LOG
+    nohup $SCRIPTS_HOME/secmon.sh productive $SID >> $POSTSTART_SCRIPTS_LOG 2>&1 &
+}
+
+# Main ###
+# know which landscape we are in now
+# and get all the sids - also have ability to override by using $WORK/sidsdefined.txt
+unset VLLANDSCAPE
+mkdir -p $WORK
+SCRIPTNAME=$(basename $0)
+
+log ""                                                                                 $SECSTARTLINUX_LOG 
+log "==========*** SECStartLinuxScript VERSION $VERSION ***======================"     $SECSTARTLINUX_LOG 
+log "Tries to check what systems exists and tries to start them on Linux startup."     $SECSTARTLINUX_LOG 
+log "Script also handles shutting them down on Linux shutdown. It has 5 phases:  "     $SECSTARTLINUX_LOG 
+log "   prestop_scripts"                                                               $SECSTARTLINUX_LOG 
+log "   appstop"                                                                       $SECSTARTLINUX_LOG 
+log "   appstart"                                                                      $SECSTARTLINUX_LOG 
+log "   poststart_scripts"                                                             $SECSTARTLINUX_LOG 
+log "========================================================================"         $SECSTARTLINUX_LOG 
+
+#WhereAreWe    in SEC we only need now to start systems and disable secmon monitoring whenever linux server reboots. no special or custom post clone scripts needed. No need to check which landscape we are in
+
+# sidsdefined.txt is for future use where we can define special systems together with their start commands
+if [ -f $SIDPREDEFINED ]; then
+    SIDLIST="$WORK/sidsdefined.txt"
+    log "There is a reference SIDs File called sidsdefined.txt under work directory. I will use that instead" $SECSTARTLINUX_LOG
+else
+    $SECSTARTLINUX_HOME/GenerateSIDsList
+    log "I will call GenerateSIDsList to check what Systems are installed in this server. Currently I can detect ABAP, J2EE, WEBDISPATCHERS and HANA instances. What I detect I put to a file SID.txt" $SECSTARTLINUX_LOG
+fi
+        
+# Reset status of this service
+rc_reset
+
+case "$1" in
+    # start wlll recurse through all available systems HANA ABAP J2EE WD and start them.
+    start)
+        log "Script START option triggered." $SECSTARTLINUX_LOG
+        cat $SIDLIST | sort | while read line
+        do
+            log "=== Reading lines from $SIDLIST to start systems in sequence ===" $SECSTARTLINUX_LOG
+            SYSTYPE=$(echo $line | awk -F: '{print $1}')
+            SID=$(echo $line | awk -F: '{print $2}')
+            SYSNO=$(echo $line | awk -F: '{print $3}')
+            USRADM=$(echo $line | awk -F: '{print $4}')
+            STARTCOMMAND=$(echo $line | awk -F: '{print $5}')
+            app_start
+            poststart_scripts
+        done
+        rc_status -v
+        log "Script START option ended." $SECSTARTLINUX_LOG
+        ;; 
+    # stop wlll recurse through all available systems WD J2EE ABAP HANA and stop them.
+    stop)
+        log "SECStartLinux STOP option triggered. Script will stop all systems in sequence starting with WD, J2EE, ABAP, then HANA." $SECSTARTLINUX_LOG
+        echo "SECStartLinux script will stop all systems in sequence starting with WD, J2EE, ABAP, then HANA."
+        cat $SIDLIST | sort -r | while read line
+        do
+            log "=== Reading lines from $SIDLIST but in reverse to stop systems in sequence ===" $SECSTARTLINUX_LOG
+            SYSTYPE=$(echo $line | awk -F: '{print $1}')
+            SID=$(echo $line | awk -F: '{print $2}')
+            SYSNO=$(echo $line | awk -F: '{print $3}')
+            USRADM=$(echo $line | awk -F: '{print $4}')
+            STARTCOMMAND=$(echo $line | awk -F: '{print $5}')
+            prestop_scripts
+            app_stop
+        done
+        rc_status -v
+        log "Script STOP option ended." $SECSTARTLINUX_LOG
+        ;;
+    # restart wlll recurse through all available systems WD J2EE ABAP HANA and stop them. Then start them starting from HANA ABAP J2EE WD
+    restart)
+        log "Script RESTART option triggered. Proceeding with stop routine." $SECSTARTLINUX_LOG
+        cat $SIDLIST | sort -r | while read line
+        do
+            log "=== Reading lines from $SIDLIST but in reverse to stop systems in sequence. Stopping WD J2EE and ABAP first before HANA. ===" $SECSTARTLINUX_LOG
+            SYSTYPE=$(echo $line | awk -F: '{print $1}')
+            SID=$(echo $line | awk -F: '{print $2}')
+            SYSNO=$(echo $line | awk -F: '{print $3}')
+            USRADM=$(echo $line | awk -F: '{print $4}')
+            STARTCOMMAND=$(echo $line | awk -F: '{print $5}')
+            app_stop
+        done
+        log "All Systems Stopped." $SECSTARTLINUX_LOG
+        log "Proceeding with start routine." $SECSTARTLINUX_LOG
+        cat $SIDLIST | sort | while read line
+        do
+            log "=== Reading lines from $SIDLIST to start systems in sequence. Starting HANA first then ABAP J2EE and WD ===" $SECSTARTLINUX_LOG
+            SYSTYPE=$(echo $line | awk -F: '{print $1}')
+            SID=$(echo $line | awk -F: '{print $2}')
+            SYSNO=$(echo $line | awk -F: '{print $3}')
+            USRADM=$(echo $line | awk -F: '{print $4}')
+            STARTCOMMAND=$(echo $line | awk -F: '{print $5}')
+            app_start
+        done
+        rc_status -v
+        log "Script RESTART option ended." $SECSTARTLINUX_LOG
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|restart}"
+        exit 1
+        ;;
+    esac
+rc_exit
+
