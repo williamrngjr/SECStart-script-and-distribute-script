@@ -1,5 +1,5 @@
 #!/bin/sh
-#
+# FP-SECMONTEST
 ### BEGIN INIT INFO
 # Provides: SequencialStopStartLogic
 # Required-Start: $ALL
@@ -131,37 +131,50 @@ function log() {
     fi
 }
 
-# checks what landscape we are in by analyzing metaData.prop
-#function WhereAreWe {
-#    log "Function WhereAreWe started to check which landscape this VM belongs to." $SECSTARTLINUX_LOG
-#    local MD_PROP="${WORK}/metaData.prop"
-#    local FENCE_TXT=$FENCE
-#    local BASH_MD_PROP="$WORK/md.sh"
+function WhereAreWe {
+    local MD_PROP="${WORK}/metaData.prop"
+    local FENCE_TXT=$FENCE
+    local BASH_MD_PROP="$WORK/md.sh"
+    test -f $MD_PROP && rm -f  $MD_PROP
+    unset http_proxy
+    /usr/bin/wget --quiet -O $MD_PROP  http://secmon-ipcheck.wdf.sap.corp:8887
+    if [ ! -s $MD_PROP ]; then
+        /usr/bin/wget --quiet -O $MD_PROP  http://secmon2.wdf.sap.corp:8887
+    fi
+    if [ ! -s $MD_PROP ]; then
+        rm -f $MD_PROP
+        /usr/bin/wget --quiet -O $MD_PROP http://secmon-trans-dmz.dmzwdf.sap.corp:8887
+        /usr/bin/dos2unix $MD_PROP
+        rm -f $BASH_MD_PROP
+        cat $MD_PROP > $BASH_MD_PROP
+        source $BASH_MD_PROP
+    else
+        test -f  $FENCE_TXT && rm -f $FENCE_TXT
+        /usr/bin/wget --quiet -O $FENCE_TXT  http://secmon2.wdf.sap.corp:8887
+        /usr/bin/dos2unix $MD_PROP
+        /usr/bin/dos2unix $FENCE_TXT
+        rm -f $BASH_MD_PROP
+        cat $MD_PROP > $BASH_MD_PROP
+        source $BASH_MD_PROP
+    fi
 
-#    test -f $MD_PROP && rm -f  $MD_PROP
-#    unset http_proxy
-#    /usr/bin/wget --quiet -O $MD_PROP  http://f0vlm:1080/metaData.prop
+    unset SHOWROOM
 
-    # assume we are in CDA if we cannot retreive metaData.prop
-#    if [ ! -s $MD_PROP ]; then
-#        rm -f $MD_PROP
-#        clusterName='CDA'
-#        log "Script was not able to retrieve metaData.prop. Script will assume this VM is in the master landscape." $SECSTARTLINUX_LOG
-#        VLLANDSCAPE="CDA"
-#    else
-#        test -f  $FENCE_TXT && rm -f $FENCE_TXT
-#        /usr/bin/wget --quiet -O $FENCE_TXT  http://f0vlm:1080/fence.txt
-#        /usr/bin/dos2unix --quiet $MD_PROP
-#        /usr/bin/dos2unix --quiet $FENCE_TXT
-#        rm -f $BASH_MD_PROP
-#        cat $MD_PROP | sed 's/&/,/g' | sed -r 's/(.*)=(.*)/\1="\2"/g' > $BASH_MD_PROP
-#        source $BASH_MD_PROP
-#        log "WhereAreWe detected VM is in landscape ${order}" $SECSTARTLINUX_LOG
-#        VLLANDSCAPE="${order}"
-        # download the metaData.prop to /opt/cldscripts/metaData.prop # added d040046 20161214
-#       wget --quiet --no-proxy http://f0vlm:1080/metaData.prop -O /opt/cldscripts/metaData.prop
-#   fi
-#}
+    echo "secmon_ip detected is $secmon_ip"
+    echo "Now entering case"
+    case $secmon_ip  in
+        10.22.253.?* | 10.22.254.?* | 10.22.255.?* | 10.22.112.?* | 10.22.113.?* | 10.22.114.?* | 10.22.115.?* | 10.22.115.
+?* | 10.22.224.?* | 10.22.72.?* | 10.22.73.?* | 10.22.74.?* | 10.22.75.?* | 10.22.37.?* | 172.18.12.?* | 172.18.13.?* | 172
+.18.14.?* | 172.18.15.?*)
+            echo "ip of this server is $secmon_ip"
+            echo "valid landscape detected"
+        ;;
+        *)
+            echo "No Master detected, exit program..."
+            exit 1
+        ;;
+    esac
+}
 
 # returns 0 if hana is up and running
 target_hana_running () {
@@ -444,7 +457,8 @@ log "   appstart"                                                               
 log "   poststart_scripts"                                                             $SECSTARTLINUX_LOG 
 log "========================================================================"         $SECSTARTLINUX_LOG 
 
-#WhereAreWe    in SEC we only need now to start systems and disable secmon monitoring whenever linux server reboots. no special or custom post clone scripts needed. No need to check which landscape we are in
+#only run the startscript on predefined landscapes by checking the ip address and matching to certain ip address patterns
+WhereAreWe
 
 # sidsdefined.txt is for future use where we can define special systems together with their start commands
 if [ -f $SIDPREDEFINED ]; then
