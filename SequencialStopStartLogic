@@ -137,20 +137,20 @@ function WhereAreWe {
     local BASH_MD_PROP="$WORK/md.sh"
     test -f $MD_PROP && rm -f  $MD_PROP
     unset http_proxy
-    /usr/bin/wget --quiet --tries=2 --timeout=1 -O $MD_PROP  http://secmon-ipcheck.wdf.sap.corp:8887
+    /usr/bin/wget --quiet --tries=2 --timeout=5 -O $MD_PROP  http://secmon-ipcheck.wdf.sap.corp:8887
     if [ ! -s $MD_PROP ]; then
-        /usr/bin/wget --quiet --tries=2 --timeout=1 -O $MD_PROP  http://secmon2.wdf.sap.corp:8887
+        /usr/bin/wget --quiet --tries=2 --timeout=5 -O $MD_PROP  http://secmon2.wdf.sap.corp:8887
     fi
     if [ ! -s $MD_PROP ]; then
         rm -f $MD_PROP
-        /usr/bin/wget --quiet --tries=2 --timeout=1 -O $MD_PROP http://secmon-trans-dmz.dmzwdf.sap.corp:8887
+        /usr/bin/wget --quiet --tries=2 --timeout=5 -O $MD_PROP http://secmon-trans-dmz.dmzwdf.sap.corp:8887
         /usr/bin/dos2unix $MD_PROP
         rm -f $BASH_MD_PROP
         cat $MD_PROP > $BASH_MD_PROP
         source $BASH_MD_PROP
     else
         test -f  $FENCE_TXT && rm -f $FENCE_TXT
-        /usr/bin/wget --quiet --tries=2 --timeout=1 -O $FENCE_TXT  http://secmon2.wdf.sap.corp:8887
+        /usr/bin/wget --quiet --tries=2 --timeout=5 -O $FENCE_TXT  http://secmon2.wdf.sap.corp:8887
         /usr/bin/dos2unix $MD_PROP
         /usr/bin/dos2unix $FENCE_TXT
         rm -f $BASH_MD_PROP
