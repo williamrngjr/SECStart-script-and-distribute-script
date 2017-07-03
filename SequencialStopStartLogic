@@ -442,6 +442,8 @@ app_start() {
 poststart_scripts() {
     log "$SID : poststart_scripts function started" $SECSTARTLINUX_LOG $POSTSTART_SCRIPTS_LOG
     nohup $SCRIPTS_HOME/secmon.sh productive $SID >> $POSTSTART_SCRIPTS_LOG 2>&1 &
+    sleep 90
+    nohup $SCRIPTS_HOME/secmon.sh productive $SID >> $POSTSTART_SCRIPTS_LOG 2>&1 &
 }
 
 # Main ###
